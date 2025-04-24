@@ -1,0 +1,636 @@
+---
+title: "xstk_CatBoost"
+author: "dCyber"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+---
+title: "XSTK"
+author: "dCyber"
+date: "`r Sys.Date()`"
+output: html_document
+---
+# A. Tiền xử lý dữ liệu
+```{r}
+# PRE-PROCESSING DATASET
+# Import dataset and change all missing value into 'NA'
+CPUs <- read.csv("C:\\Users\\LENOVO\\Downloads\\xstk\\Intel_CPUs.csv", na.string = c("", "N/A"))
+
+# Picking the necessary column 
+CPUs_data <- CPUs[, c("Product_Collection", "Vertical_Segment", "Status", "Launch_Date",
+                      "Lithography", "Recommended_Customer_Price", "nb_of_Cores", "nb_of_Threads",
+                      "Processor_Base_Frequency", "Cache", "TDP", "Max_Memory_Size",
+                      "Max_nb_of_Memory_Channels", "Max_Memory_Bandwidth", "Instruction_Set")]
+
+# Print out the summary statistics
+summary(CPUs_data)
+
+# Checking for defective data
+apply(is.na(CPUs_data), 2, sum)
+
+# Remove rows with missing value
+CPUs_data <- CPUs_data[complete.cases(CPUs_data$Launch_Date), ]
+
+# Remove quarter: extracts characters from the 2nd last position to the last position of each element
+CPUs_data$Launch_Date <- substr(CPUs_data$Launch_Date, nchar(CPUs_data$Launch_Date)-1, nchar(CPUs_data$Launch_Date))
+CPUs_data$Launch_Date <- as.integer(CPUs_data$Launch_Date)
+
+# Any value greater than current year will be assumed to be made in the 20 century
+CPUs_data$Launch_Date <- ifelse(CPUs_data$Launch_Date > 24, 1900 + CPUs_data$Launch_Date, 2000 + CPUs_data$Launch_Date)
+
+# Reorganize dataset with order priorities ProductCollection, VerticalSegment and LaunchDate
+CPUs_data <- CPUs_data[order(CPUs_data$Product_Collection, CPUs_data$Vertical_Segment), ]
+
+(head(CPUs_data$Launch_Date))
+library(zoo)
+CPUs_data$Lithography <- na.locf(CPUs_data$Lithography)
+
+# Last Observation Carried Forward (filling in any missing values in that column with the last observed value.)
+CPUs_data$Lithography <- as.double(gsub(" nm$", "", CPUs_data$Lithography))
+
+(head(CPUs_data$Lithography))
+
+# Calculate the ratio between the number of threads (nb_of_Threads) and the number of cores (nb_of_Cores)
+ratio <- as.double(CPUs_data$nb_of_Threads / CPUs_data$nb_of_Cores)
+summary(ratio)
+
+# Calculate the Pearson correlation coefficient between nb_of_Threads and nb_of_Cores
+(correlation <- cor(CPUs_data$nb_of_Threads, CPUs_data$nb_of_Cores, method = "pearson", use = "complete.obs"))
+
+# Seeing that nbOfThreads and nbOfCores has a high correlation value
+# And median of the ratio of those two was 2,
+# So we assume that every Core will come with 2 Threads
+CPUs_data$nb_of_Threads <- ifelse(is.na(CPUs_data$nb_of_Threads), 
+                                  CPUs_data$nb_of_Cores * 2, CPUs_data$nb_of_Threads)
+# remove missing data cells
+CPUs_data <- CPUs_data[complete.cases(CPUs_data$Max_Memory_Size),]
+
+# Convert data to the same units: TB -> GB
+Mem_size_func <- function(size){
+  if(grepl('G', size)){
+    return ( as.double(gsub(" GB","", size)) )
+  }
+  return ( as.double(gsub(" TB","", size)) * 1024 )
+}
+
+CPUs_data$Max_Memory_Size <- sapply(CPUs_data$Max_Memory_Size, Mem_size_func)
+
+(hist(CPUs_data$Max_Memory_Size, breaks = 18))
+
+# Clean the memory bandwidth data (**Max_Memory_Bandwidth**)
+bandwidth_clean <- function(mem){
+  return ( as.double(strsplit(mem, " ")[[1]][1]) )
+}
+CPUs_data$Max_Memory_Bandwidth <- sapply(CPUs_data$Max_Memory_Bandwidth, bandwidth_clean)
+
+# Calculate the correlation coefficient between Max_Memory_Bandwidth and Max_nb_of_Memory_Channels
+correlation <- cor(CPUs_data$Max_Memory_Bandwidth, CPUs_data$Max_nb_of_Memory_Channels, 
+                   method = "pearson", use = "complete.obs")
+
+# Fill missing values (NA) with the median of the group
+fill_na_with_group_median <- function(data, group_var, fill_var) {
+  data <- data %>%
+    group_by({{group_var}}) %>%
+    mutate({{fill_var}} := if_else(is.na({{fill_var}}), median({{fill_var}}, na.rm = TRUE), {{fill_var}})) %>%
+    ungroup()
+  
+  return(data)
+}
+
+# Apply a function to fill missing values
+library(dplyr)
+CPUs_data <- fill_na_with_group_median(CPUs_data, Max_nb_of_Memory_Channels, Max_Memory_Bandwidth)
+
+# Normalize the Product_Collection column in the CPUs_data dataset
+groups <- c('Atom', 'Celeron', 'Core', 'Itanium', 'Legacy', 'Pentium', 'Quark', 'Xeon')
+
+for (item in groups) {
+  CPUs_data$Product_Collection <- ifelse(grepl(item, CPUs_data$Product_Collection), item, CPUs_data$Product_Collection)
+}
+
+(head(CPUs_data))
+
+head(CPUs_data$TDP)
+
+# Convert to quantitative form
+CPUs_data$TDP <- as.double(gsub(" W", "", CPUs_data$TDP))
+
+# Fill missing values using Last Observation Carried Forward (LOCF) method within each category of Vertical_Segment
+CPUs_data$TDP <- ave(CPUs_data$TDP, CPUs_data$Vertical_Segment, FUN = function(x) na.locf(x, na.rm = FALSE))
+
+head(CPUs_data$TDP)
+
+Cache_Size_Clean <- function(size){  # default: MB
+  if(grepl('M',size)){
+    return (as.double(gsub(" M","",size)))
+  }
+  else{
+    return (as.double(gsub(" K","",size)) / 1024)
+  }
+}
+
+# Split into 2 categories => type & cache
+library(tidyr)
+
+CPUs_data <- separate(CPUs_data, Cache, into = c("Cache_Size", "Cache_Type"), sep="B")
+
+# Add 'normal' to absence value
+CPUs_data$Cache_Type <- ifelse(CPUs_data$Cache_Type == "", "Normal", sub(" .","",CPUs_data$Cache_Type))
+
+# Convert to quantitative form
+CPUs_data$Cache_Size <- sapply(CPUs_data$Cache_Size, Cache_Size_Clean)
+summary(CPUs_data$Cache_Size)
+
+# Filter data from CPUs_data, keeping only rows without missing values (NA) in the Instruction_Set column
+(SubData <- CPUs_data[complete.cases(CPUs_data$Instruction_Set), ])
+
+(temp <- as.double(gsub("-bit", "", SubData$Instruction_Set)))
+
+summary(temp)
+
+# Seeing temp having 64 as median, I fill all the missing gap with 64-bit
+
+CPUs_data$Instruction_Set <- na.fill(CPUs_data$Instruction_Set,"64-bit")
+
+# Removing unnecessary
+# '$' is a reserved character -> \\$
+
+CPUs_data$Recommended_Customer_Price <- gsub("\\$", "", CPUs_data$Recommended_Customer_Price)
+CPUs_data$Recommended_Customer_Price <- gsub(",", "", CPUs_data$Recommended_Customer_Price)
+
+# Get the average value for the data as an estimate range
+recommend_price <- function(price_range) {
+  if(grepl('-', price_range)) {
+    range <- strsplit(price_range, "-")[[1]]  # there is no [[2]] => null
+    return((as.double(range[1]) + as.double(range[2])) / 2)
+  }
+  return (price_range)
+}
+
+CPUs_data$Recommended_Customer_Price <- sapply(CPUs_data$Recommended_Customer_Price, recommend_price)
+CPUs_data$Recommended_Customer_Price <- as.double(CPUs_data$Recommended_Customer_Price)
+
+# Fill in missing values with the nearest value within the same **Product_Collection** group
+CPUs_data <- CPUs_data %>%  # piping
+  group_by(Product_Collection) %>%  # group by productionCollection
+  fill(Recommended_Customer_Price, .direction = "updown")  # closest non-missing value
+
+# GHz for reference
+frequency_clean <- function(f){
+  if (grepl(" GHz", f)) {
+    return (as.double(gsub(" GHz","", f)))
+  }
+  return (as.double(gsub(" MHz","", f)) / 1000)
+}
+
+CPUs_data$Processor_Base_Frequency <- as.double( 
+  sapply(CPUs_data$Processor_Base_Frequency, frequency_clean)
+)
+
+# Fill in missing values (NA) in the **Processor_Base_Frequency** column for rows where **Vertical_Segment == "Mobile"**
+subset <- CPUs_data[CPUs_data$Vertical_Segment == "Mobile", "Processor_Base_Frequency"]
+CPUs_data[CPUs_data$Vertical_Segment == "Mobile", "Processor_Base_Frequency"] <- na.locf(subset)
+
+# Function to detect outliers using the IQR method
+detect_outlier_iqr <- function(x) {
+  Q1 <- quantile(x, 0.25, na.rm = TRUE)  # First quartile (25%)
+  Q3 <- quantile(x, 0.75, na.rm = TRUE)  # Third quartile (75%)
+  IQR <- Q3 - Q1                         # Interquartile Range
+  return(x < (Q1 - 1.5 * IQR) | x > (Q3 + 1.5 * IQR))  # Boolean: is outlier?
+}
+
+# List of numeric columns to check for outliers
+numeric_cols <- c("Recommended_Customer_Price", "Processor_Base_Frequency", 
+                  "Cache_Size", "TDP", "Max_Memory_Size", "Max_Memory_Bandwidth")
+
+# Loop through each column
+for (col in numeric_cols) {
+  # Detect outliers
+  is_outlier <- detect_outlier_iqr(CPUs_data[[col]])
+  
+  # Calculate the median value (excluding NA)
+  median_val <- median(CPUs_data[[col]], na.rm = TRUE)
+  
+  # Replace outlier values with the median
+  CPUs_data[[col]][is_outlier] <- median_val
+}
+
+# Optional: check the number of outliers per column (after replacement it should be 0)
+for (col in numeric_cols) {
+  cat(paste("Outliers in", col, ":", sum(detect_outlier_iqr(CPUs_data[[col]])), "\n"))
+}
+
+
+# Checking for defective data
+apply(is.na(CPUs_data), 2, sum)
+str(CPUs_data)
+```
+# Plot display
+```{r}
+numeric_cols <- c("Launch_Date", "nb_of_Threads", "nb_of_Cores", "Max_Memory_Size",
+                  "Max_Memory_Bandwidth", "Processor_Base_Frequency", "Cache_Size",
+                  "Lithography", "TDP", "Recommended_Customer_Price")
+
+# Verify the structure of your data
+str(CPUs_data[, numeric_cols])
+
+
+Mean <- apply(CPUs_data[, numeric_cols], 2, mean, na.rm = TRUE)
+SD <- apply(CPUs_data[, numeric_cols], 2, sd, na.rm = TRUE)
+Q1 <- apply(CPUs_data[, numeric_cols], 2, quantile, probs = 0.25, na.rm = TRUE)
+Median <- apply(CPUs_data[, numeric_cols], 2, median, na.rm = TRUE)
+Q3 <- apply(CPUs_data[, numeric_cols], 2, quantile, probs = 0.75, na.rm = TRUE)
+Min <- apply(CPUs_data[, numeric_cols], 2, min, na.rm = TRUE)
+Max <- apply(CPUs_data[, numeric_cols], 2, max, na.rm = TRUE)
+
+descriptive_stats <- data.frame(Min, Max, Mean, SD, Q1, Median, Q3)
+print(descriptive_stats)
+
+# Histograms for numeric columns
+par(mfrow = c(3, 4)) # Adjust layout as needed
+hist(CPUs_data$Launch_Date, xlab = "Launch_Year", ylab = "Frequency", main = "Histogram of Launch_Year")
+hist(CPUs_data$nb_of_Threads, xlab = "nb_of_Threads", ylab = "Frequency", main = "Histogram of nb_of_Threads")
+hist(CPUs_data$nb_of_Cores, xlab = "nb_of_Cores", ylab = "Frequency", main = "Histogram of nb_of_Cores")
+hist(CPUs_data$Max_Memory_Size, xlab = "Max_Memory_Size (GB)", ylab = "Frequency", main = "Histogram of Max_Memory_Size")
+hist(CPUs_data$Max_Memory_Bandwidth, xlab = "Max_Memory_Bandwidth (GT/s)", ylab = "Frequency", main = "Histogram of Max_Memory_Bandwidth")
+hist(CPUs_data$Processor_Base_Frequency, xlab = "Processor_Base_Frequency (GHz)", ylab = "Frequency", main = "Histogram of Processor_Base_Frequency")
+hist(CPUs_data$Cache_Size, xlab = "Cache_Size (MB)", ylab = "Frequency", main = "Histogram of Cache_Size")
+hist(CPUs_data$Lithography, xlab = "Lithography (nm)", ylab = "Frequency", main = "Histogram of Lithography")
+hist(CPUs_data$TDP, xlab = "TDP (W)", ylab = "Frequency", main = "Histogram of TDP")
+hist(CPUs_data$Recommended_Customer_Price, xlab = "Recommended_Customer_Price ($)", ylab = "Frequency", main = "Histogram of Recommended_Customer_Price")
+par(mfrow = c(1, 1)) # Reset plot layout
+
+# Scatter plots for numeric columns against Processor_Base_Frequency
+par(mfrow = c(3, 3)) # Adjust layout as needed
+plot(CPUs_data$Launch_Date, CPUs_data$Processor_Base_Frequency, xlab = "Launch_Year", ylab = "Processor_Base_Frequency (GHz)", main = "Launch_Year vs. Processor_Base_Frequency", col = "orange", pch = 16)
+plot(CPUs_data$nb_of_Threads, CPUs_data$Processor_Base_Frequency, xlab = "nb_of_Threads", ylab = "Processor_Base_Frequency (GHz)", main = "nb_of_Threads vs. Processor_Base_Frequency", col = "orange", pch = 16)
+plot(CPUs_data$nb_of_Cores, CPUs_data$Processor_Base_Frequency, xlab = "nb_of_Cores", ylab = "Processor_Base_Frequency (GHz)", main = "nb_of_Cores vs. Processor_Base_Frequency", col = "orange", pch = 16)
+plot(CPUs_data$Max_Memory_Size, CPUs_data$Processor_Base_Frequency, xlab = "Max_Memory_Size (GB)", ylab = "Processor_Base_Frequency (GHz)", main = "Max_Memory_Size vs. Processor_Base_Frequency", col = "orange", pch = 16)
+plot(CPUs_data$Max_Memory_Bandwidth, CPUs_data$Processor_Base_Frequency, xlab = "Max_Memory_Bandwidth (GT/s)", ylab = "Processor_Base_Frequency (GHz)", main = "Max_Memory_Bandwidth vs. Processor_Base_Frequency", col = "orange", pch = 16)
+plot(CPUs_data$Cache_Size, CPUs_data$Processor_Base_Frequency, xlab = "Cache_Size (MB)", ylab = "Processor_Base_Frequency (GHz)", main = "Cache_Size vs. Processor_Base_Frequency", col = "orange", pch = 16)
+plot(CPUs_data$Lithography, CPUs_data$Processor_Base_Frequency, xlab = "Lithography (nm)", ylab = "Processor_Base_Frequency (GHz)", main = "Lithography vs. Processor_Base_Frequency", col = "orange", pch = 16)
+plot(CPUs_data$TDP, CPUs_data$Processor_Base_Frequency, xlab = "TDP (W)", ylab = "Processor_Base_Frequency (GHz)", main = "TDP vs. Processor_Base_Frequency", col = "orange", pch = 16)
+plot(CPUs_data$Recommended_Customer_Price, CPUs_data$Processor_Base_Frequency, xlab = "Recommended_Customer_Price ($)", ylab = "Processor_Base_Frequency (GHz)", main = "Recommended_Customer_Price vs. Processor_Base_Frequency", col = "orange", pch = 16)
+par(mfrow = c(1, 1)) # Reset plot layout
+
+# Boxplots of Processor_Base_Frequency by categorical variables
+par(mfrow = c(1, 2)) # Adjust layout as needed
+boxplot(CPUs_data$Processor_Base_Frequency ~ CPUs_data$Vertical_Segment, xlab = "Vertical_Segment", ylab = "Processor_Base_Frequency (GHz)", main = "Processor_Base_Frequency by Vertical_Segment", col = "lightgreen")
+boxplot(CPUs_data$Processor_Base_Frequency ~ CPUs_data$Status, xlab = "Status", ylab = "Processor_Base_Frequency (GHz)", main = "Processor_Base_Frequency by Status", col = "lightgreen")
+par(mfrow = c(1, 1)) # Reset plot layout
+
+
+```
+#Anova 1 nhân tố
+```{r}
+library(car)
+library(nortest) 
+library(ggplot2)
+# Đảm bảo các biến là factor
+CPUs_data$nb_of_Cores <- as.factor(CPUs_data$nb_of_Cores)
+CPUs_data$Vertical_Segment <- as.factor(CPUs_data$Vertical_Segment)
+
+# ===============================
+# 🔍 Giả định 1: Kiểm tra phân phối chuẩn của residuals
+# ===============================
+anova_model <- aov(Processor_Base_Frequency ~ nb_of_Cores * Vertical_Segment, data = CPUs_data)
+av_residual <- rstandard(anova_model)
+
+# Kiểm định Anderson-Darling (phân phối chuẩn)
+ad_test_result <- ad.test(av_residual)
+print(ad_test_result)
+
+# Vẽ Q-Q plot để kiểm tra trực quan
+qqnorm(av_residual)
+qqline(av_residual, col = "red")
+
+# ===============================
+# 🔍 Giả định 2: Kiểm tra đồng nhất phương sai
+# ===============================
+levene_test <- leveneTest(Processor_Base_Frequency ~ Vertical_Segment * nb_of_Cores, data = CPUs_data)
+print(levene_test)
+
+# ===============================
+# 📊 Phân tích ANOVA 2 chiều
+# ===============================
+summary(anova_model)
+
+# ===============================
+# 📈 Trực quan hóa tương tác giữa 2 yếu tố
+# ===============================
+ggplot(CPUs_data, aes(x = nb_of_Cores, y = Processor_Base_Frequency, fill = Vertical_Segment)) +
+  geom_boxplot(position = position_dodge(0.8)) +
+  labs(title = "Base Frequency theo số nhân và phân khúc sản phẩm", 
+       x = "Số nhân (nb_of_Cores)", 
+       y = "Processor Base Frequency (GHz)") +
+  theme_minimal()
+
+```
+# Anova 2 nhân tố
+```{r}
+# Đảm bảo các biến là factor
+CPUs_data$nb_of_Cores <- as.factor(CPUs_data$nb_of_Cores)
+CPUs_data$Vertical_Segment <- as.factor(CPUs_data$Vertical_Segment)
+
+# ===============================
+# 🔍 Giả định 1: Kiểm tra phân phối chuẩn của residuals
+# ===============================
+anova_model <- aov(Processor_Base_Frequency ~ nb_of_Cores * Vertical_Segment, data = CPUs_data)
+av_residual <- rstandard(anova_model)
+
+# Kiểm định Anderson-Darling (phân phối chuẩn)
+ad_test_result <- ad.test(av_residual)
+print(ad_test_result)
+
+# Vẽ Q-Q plot để kiểm tra trực quan
+qqnorm(av_residual)
+qqline(av_residual, col = "red")
+
+# ===============================
+# 🔍 Giả định 2: Kiểm tra đồng nhất phương sai
+# ===============================
+levene_test <- leveneTest(Processor_Base_Frequency ~ Vertical_Segment * nb_of_Cores, data = CPUs_data)
+print(levene_test)
+
+# ===============================
+# 📊 Phân tích ANOVA 2 chiều
+# ===============================
+summary(anova_model)
+
+# ===============================
+# 📈 Trực quan hóa tương tác giữa 2 yếu tố
+# ===============================
+ggplot(CPUs_data, aes(x = nb_of_Cores, y = Processor_Base_Frequency, fill = Vertical_Segment)) +
+  geom_boxplot(position = position_dodge(0.8)) +
+  labs(title = "Base Frequency theo số nhân và phân khúc sản phẩm", 
+       x = "Số nhân (nb_of_Cores)", 
+       y = "Processor Base Frequency (GHz)") +
+  theme_minimal()
+```
+# C. Bài toán hồi quy tuyến tính đơn
+```{r}
+# Tách dữ liệu thành hai phần cho Mobile và Desktop
+library(dplyr)
+
+data_Mobile  <- filter(CPUs_data, Vertical_Segment == "Mobile")
+data_Desktop <- filter(CPUs_data, Vertical_Segment == "Desktop")
+```
+```{r}
+# Tạo biểu đồ phân tán và đường hồi quy cho Mobile 
+library(ggplot2)
+
+ggplot(data_Mobile, aes(x = Processor_Base_Frequency, y = TDP )) +
+  geom_point() +
+  geom_smooth(method = "lm", se = T, color = "blue") +
+  labs(title = "Scatter Plot and Linear Regression Line for Mobile",
+       x = "Processor Base Frequency (GHz)",
+       y = "TDP (Thermal Design Power)")
+
+# Tạo biểu đồ phân tán và đường hồi quy cho Desktop
+ggplot(data_Desktop, aes(x = Processor_Base_Frequency, y = TDP )) +
+  geom_point() +
+  geom_smooth(method = "lm", se = T, color = "red") +
+  labs(title = "Scatter Plot and Linear Regression Line for Desktop",
+       x = "Processor Base Frequency (GHz)",
+       y = "TDP (Thermal Design Power)")
+```
+
+
+```{r}
+# Mô hình hồi quy cho Mobile
+model_Mobile <- lm(Processor_Base_Frequency ~ TDP, data = data_Mobile)
+summary(model_Mobile)
+
+# Mô hình hồi quy cho Desktop
+model_Desktop <- lm(Processor_Base_Frequency ~ TDP, data = data_Desktop)
+summary(model_Desktop)
+```
+```{r}
+# Dự đoán cho Mobile
+new_data_Mobile <- data.frame(TDP = c(45, 50, 55))  
+predictions_Mobile <- predict(model_Mobile, newdata = new_data_Mobile)
+
+# Dự đoán cho Desktop
+new_data_Desktop <- data.frame(TDP = c(40, 60, 65))  
+predictions_Desktop <- predict(model_Desktop, newdata = new_data_Desktop)
+
+# Hiển thị kết quả dự đoán 
+result_Mobile <- cbind(new_data_Mobile, Predictions = predictions_Mobile)
+print(result_Mobile)
+result_Desktop <- cbind(new_data_Desktop, Predictions = predictions_Desktop)
+print(result_Desktop)
+```
+
+#D. mô hình hồi quy tuyến tính bội
+```{r}
+# Dữ liệu cho Mobile
+data_Mobile <- subset(CPUs_data, Vertical_Segment == "Mobile")
+
+# Hồi quy cho Mobile
+model_Mobile <- lm(Processor_Base_Frequency ~ Launch_Date + Lithography + TDP + 
+                   nb_of_Cores + nb_of_Threads + Cache_Size + 
+                   Max_Memory_Bandwidth + Max_nb_of_Memory_Channels + 
+                   Recommended_Customer_Price, data = data_Mobile)
+
+summary(model_Mobile)
+
+# Dữ liệu cho Desktop
+data_Desktop <- subset(CPUs_data, Vertical_Segment == "Desktop")
+
+# Hồi quy cho Desktop
+model_Desktop <- lm(Processor_Base_Frequency ~ Launch_Date + Lithography + TDP + 
+                    nb_of_Cores + nb_of_Threads + Cache_Size + 
+                    Max_Memory_Bandwidth + Max_nb_of_Memory_Channels + 
+                    Recommended_Customer_Price, data = data_Desktop)
+summary(model_Desktop)
+
+# Mô hình hồi quy cải tiến cho Desktop
+model_updated <- lm(Processor_Base_Frequency ~ Launch_Date + Lithography + TDP + 
+                    nb_of_Cores + nb_of_Threads + Cache_Size + Recommended_Customer_Price, 
+                    data = data_Mobile)
+
+summary(model_updated)
+
+#So sánh 2 mô hình
+shapiro.test(resid(model_updated))
+AIC(model_Desktop)
+AIC(model_updated)
+
+```
+
+```{r}
+# Kiểm tra giả định của các mô hình.
+# Vẽ hình cho mô hình Mobile và Desktop
+par(mfrow = c(2, 2))  # Chia cửa sổ đồ thị thành 2 hàng, 2 cột
+plot(model_Mobile)
+plot(model_Desktop)
+
+```
+```{r}
+# Dự đoán cho Mobile với dữ liệu mới 
+new_data_Mobile <- data.frame(
+  Launch_Date = c(2023, 2024, 2025),  
+  Lithography = c(14, 12, 10),         
+  TDP = c(45, 50, 55),                 
+  nb_of_Cores = c(6, 8, 10),          
+  nb_of_Threads = c(12, 16, 20),      
+  Cache_Size = c(12, 16, 20),          
+  Max_Memory_Bandwidth = c(25, 30, 35),
+  Max_nb_of_Memory_Channels = c(2, 2, 2), 
+  Recommended_Customer_Price = c(300, 350, 400) 
+)
+
+# Dự đoán cho Desktop với dữ liệu mới
+new_data_Desktop <- data.frame(
+  Launch_Date = c(2023, 2024, 2025), 
+  Lithography = c(14, 12, 10),         
+  TDP = c(65, 70, 75),                
+  nb_of_Cores = c(8, 10, 12),          
+  nb_of_Threads = c(16, 20, 24),       
+  Cache_Size = c(16, 20, 24),          
+  Max_Memory_Bandwidth = c(32, 40, 50), 
+  Max_nb_of_Memory_Channels = c(2, 2, 2), 
+  Recommended_Customer_Price = c(400, 450, 500) 
+)
+
+# Dự đoán với mô hình hồi quy Mobile
+predictions_Mobile <- predict(model_Mobile, newdata = new_data_Mobile)
+# Dự đoán với mô hình hồi quy Desktop
+predictions_Desktop <- predict(model_Desktop, newdata = new_data_Desktop)
+
+
+```
+
+```{r}
+# Hiển thị kết quả dự đoán cho Mobile chỉ với năm và Predicted_Processor_Base_Frequency
+result_Mobile <- data.frame(
+  Year = c(2023, 2024, 2025),
+  Predicted_Processor_Base_Frequency = predictions_Mobile
+)
+# Hiển thị kết quả dự đoán cho Desktop chỉ với năm và Predicted_Processor_Base_Frequency
+result_Desktop <- data.frame(
+  Year = c(2023, 2024, 2025),
+  Predicted_Processor_Base_Frequency = predictions_Desktop
+)
+print(result_Mobile)
+print(result_Desktop)
+```
+
+
+# E. Mô hình CatBoost dạng hồi quy
+```{r}
+library("catboost")
+library("caret")
+library("Metrics")
+
+CPUs_data$Vertical_Segment <- as.factor(CPUs_data$Vertical_Segment)
+CPUs_data$Status <- as.factor(CPUs_data$Status)
+CPUs_data$Cache_Type <- as.factor(CPUs_data$Cache_Type)
+CPUs_data$Instruction_Set <- as.factor(CPUs_data$Instruction_Set)
+# Chia dữ liệu train/test
+idx <- createDataPartition(CPUs_data$Processor_Base_Frequency, p = 0.8, list = FALSE)
+
+CPU_train <- CPUs_data[idx,]
+CPU_test <- CPUs_data[-idx,]
+
+# Xác định các biến phân loại
+cat_columns <- c("Vertical_Segment","Status","Cache_Type","Instruction_Set")
+cat_columnsf <- c("Vertical_Segment")
+cat_features <- which(names(CPU_train) %in% cat_columnsf)
+
+# Chọn các feature
+features_train <- CPU_train[, c("Vertical_Segment", "Status", "Lithography", "nb_of_Cores", 
+                                "nb_of_Threads", "Cache_Size", "TDP", "Max_Memory_Size", 
+                                "Max_nb_of_Memory_Channels", "Max_Memory_Bandwidth", 
+                                "Cache_Type", "Instruction_Set")]
+features_trainf <- CPU_train[, c("Vertical_Segment", "Lithography", "nb_of_Cores", 
+                                "nb_of_Threads", "Cache_Size", "TDP", "Max_Memory_Size", 
+                                "Max_nb_of_Memory_Channels", "Max_Memory_Bandwidth")]
+label_train <- CPU_train$Processor_Base_Frequency
+
+# Tạo Pool dữ liệu train
+train_pool <- catboost.load_pool(data = features_trainf, label = label_train)
+
+# Định nghĩa tham số
+params <- list(
+  loss_function = 'RMSE',  
+  iterations = 300,          
+  depth = 4,                
+  learning_rate = 0.2,       
+  boosting_type = 'Ordered',
+  eval_metric = 'RMSE',  
+  verbose = 200
+)
+
+# Huấn luyện mô hình
+model <- catboost.train(train_pool, NULL, params = params)
+
+# Tạo tập test
+features_test <- CPU_test[, c("Vertical_Segment", "Status", "Lithography", "nb_of_Cores", 
+                              "nb_of_Threads", "Cache_Size", "TDP", "Max_Memory_Size", 
+                              "Max_nb_of_Memory_Channels", "Max_Memory_Bandwidth", 
+                              "Cache_Type", "Instruction_Set")]
+features_testf <- CPU_test[, c("Vertical_Segment", "Lithography", "nb_of_Cores", 
+                              "nb_of_Threads", "Cache_Size", "TDP", "Max_Memory_Size", 
+                              "Max_nb_of_Memory_Channels", "Max_Memory_Bandwidth"
+                              )]
+test_pool <- catboost.load_pool(data = features_testf)
+
+preds <- catboost.predict(model, test_pool)
+
+actual_values <- CPU_test$Processor_Base_Frequency
+
+rmse_value <- rmse(actual_values, preds)
+mae_value <- mae(actual_values, preds)
+r2_value <- 1 - sum((actual_values - preds)^2) / sum((actual_values - mean(actual_values))^2)
+
+# In kết quả
+cat("RMSE:", rmse_value, "\n")
+cat("MAE:", mae_value, "\n")
+cat("R²:", r2_value, "\n")
+
+```
+```{r}
+library(ggplot2)
+
+data <- data.frame(x = actual_values, y = preds)
+
+# Vẽ đồ thị
+ggplot(data, aes(x=actual_values, y=preds)) +
+  geom_abline(slope = 1, intercept = 0, color = "black", linetype = "dashed") +
+  geom_point(color="red") +
+  labs(title="So sánh giá trị do mô hình dự đoán và giá trị thực tế", x="Processor Base Frequency thực tế", y="Processor Base Frequency dự đoán")
+```
+```{r}
+importance <- catboost.get_feature_importance(model)
+
+feature_names <- colnames(features_train)
+feature_importance <- data.frame(
+  Feature = feature_names,
+  Importance = importance
+)
+
+# Sắp xếp theo độ quan trọng giảm dần
+feature_importance <- feature_importance[order(feature_importance$Importance, decreasing = TRUE), ]
+
+# In ra thứ tự các feature với độ quan trọng
+print(feature_importance)
+barplot(feature_importance$Importance, 
+        names.arg = feature_importance$Feature, 
+        main = "Feature importance", 
+        col = "lightblue", 
+        las = 2,  # Xoay nhãn trục x cho dễ đọc
+        cex.names = 0.5,  # Điều chỉnh kích thước chữ nếu cần
+        horiz = TRUE)  # Vẽ bar plot ngang
+```
